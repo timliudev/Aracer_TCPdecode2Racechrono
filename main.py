@@ -1,4 +1,4 @@
-from twisted.internet import reactor, protocol, defer
+from twisted.internet import reactor, protocol
 from twisted.internet.protocol import DatagramProtocol
 import sys
 from datetime import datetime
@@ -13,6 +13,10 @@ ecu_port = 6666  # ECU端口
 ecu_udp_port = 8888  # ECU UDP broadcast端口
 ecu_find_str = b'aRacer'  # ECU發現的關鍵字+
 log_switch = False  # 日誌開關
+FRAME_HEADER = bytes.fromhex("f801c0")
+FRAME_LENGTH_OFFSET = 3
+FRAME_OVERHEAD = 5  # header, length byte, and checksum
+MAX_FRAME_LENGTH = 512
 
 
 # print_with_time的時候加上時間
@@ -35,6 +39,56 @@ def read_config():
     init = [bytes.fromhex(line.strip()) for line in lines[4:]]
 
     return watchdog, init
+
+
+def aracer_checksum_ok(frame):
+    return (sum(frame[2:]) & 0xff) == 0
+
+
+class HeaderFramer:
+    def __init__(self, header, frame_length=None):
+        self.header = header
+        self.frame_length = frame_length
+        self.buffer = b""
+
+    def feed(self, data):
+        self.buffer += data
+        frames = []
+
+        while True:
+            start = self.buffer.find(self.header)
+
+            if start < 0:
+                keep = len(self.header) - 1
+                self.buffer = self.buffer[-keep:]
+                break
+
+            if start > 0:
+                self.buffer = self.buffer[start:]
+
+            if self.frame_length is None:
+                if len(self.buffer) <= FRAME_LENGTH_OFFSET:
+                    break
+
+                frame_length = self.buffer[FRAME_LENGTH_OFFSET] + FRAME_OVERHEAD
+                if frame_length > MAX_FRAME_LENGTH:
+                    self.buffer = self.buffer[1:]
+                    continue
+            else:
+                frame_length = self.frame_length
+
+            if len(self.buffer) < frame_length:
+                break
+
+            frame = self.buffer[:frame_length]
+            if not aracer_checksum_ok(frame):
+                self.buffer = self.buffer[1:]
+                continue
+
+            frames.append(frame)
+            self.buffer = self.buffer[frame_length:]
+
+        return frames
 
 
 # 這個class是用來處理ECU UDP發現的
@@ -80,38 +134,49 @@ class EcuClient(protocol.Protocol):
     # 初始化config.txt的內容
     def __init__(self):
         self.watchdog, self.init = read_config()  # 讀取config.txt的內容
+        self.framer = HeaderFramer(FRAME_HEADER)
+        self.decoder = decoode.EcuDecoder()
+        self.watchdog_call = None
+        self.init_call = None
+        self.connected = False
 
     # 連線成功後執行
     def connectionMade(self):
         print_with_time("Connected to the ecu.")
+        self.connected = True
         self.transport.setTcpNoDelay(True)  # 關閉 Nagle 算法
         self.send_init()  # 發送初始化數據
-        reactor.callLater(1, self.send_watchdog)  # 每1秒發送一次 watchdog
+        self.watchdog_call = reactor.callLater(1, self.send_watchdog)  # 每1秒發送一次 watchdog
+
+    def connectionLost(self, reason):
+        self.connected = False
+        for call in (self.watchdog_call, self.init_call):
+            if call is not None and call.active():
+                call.cancel()
 
     # 發送初始化數據
     def send_init(self):
         if self.init:
             item = self.init.pop(0)
             self.transport.write(item)
-            reactor.callLater(0.01, self.send_init)
+            self.init_call = reactor.callLater(0.01, self.send_init)
 
     # 發送 watchdog
     def send_watchdog(self):
+        if not self.connected:
+            return
         self.transport.write(self.watchdog)
-        reactor.callLater(1, self.send_watchdog)
+        self.watchdog_call = reactor.callLater(1, self.send_watchdog)
 
     # 接收數據
     def dataReceived(self, data):
-        # 使用 Deferred 將接收到的數據轉交給外部函數處理
-        rc3 = defer.Deferred()  # 創建一個Deferred對象
-        rc3.addCallback(decoode.convert)  # 添加一個外部decode回調函數
-        rc3.addCallback(broadcast)  # 添加一個向server發送數據的回調函數
-        rc3.callback(data)  # 調用callback方法，將數據傳遞給回調函數
+        for frame in self.framer.feed(data):
+            message = self.decoder.decode_frame(frame)
+            if message:
+                broadcast(message)
 
         # 將數據寫入日誌
-        log = defer.Deferred()  # 創建一個Deferred對象
-        log.addCallback(self.log_ecu)  # 添加一個日誌回調函數
-        log.callback(data)  # 調用callback方法，將數據傳遞給回調函數
+        self.log_ecu(data)
 
     # 日誌回調函數
     def log_ecu(self, data):
@@ -171,12 +236,12 @@ class RC3serverFactory(protocol.Factory):
 
 # 向所有客戶端廣播數據
 def broadcast(message):
+    if not message:
+        return
     clients = factory.clients  # 獲取clients列表
     for client in clients:  # 遍歷clients列表
         client.transport.write(message.encode())  # 向每個客戶端發送數據
-    log = defer.Deferred()  # 創建一個Deferred對象
-    log.addCallback(log_rc3)  # 添加一個日誌回調函數
-    log.callback(message)  # 調用callback方法，將數據傳遞給回調函數
+    log_rc3(message)
 
 
 # 日誌回調函數
